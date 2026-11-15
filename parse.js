@@ -7,9 +7,19 @@
 export function parse(markdown) {
   const src = String(markdown).replace(/\r\n?/g, '\n');
   const refs = Object.create(null);
+  docInLink = false;
   const blocks = parseBlocks(src, refs);
   return renderBlocks(blocks, refs);
 }
+
+// Document-level GFM-autolink suppression, mirroring marked's lexer
+// state: an unclosed <a ...> tag (inline HTML matching /^<a /i) sets
+// this for the rest of the document, and only a literal </a> clears
+// it. While set, no GFM autolink (URL or e-mail) is formed anywhere
+// — markdown links, emphasis and code spans are unaffected. Link and
+// image text parsing saves and restores it (marked's De does the
+// same), so a tag inside link text does not leak out.
+let docInLink = false;
 
 // ---------------------------------------------------------------- helpers
 
@@ -213,7 +223,7 @@ function parseInline(s, refs, inLink) {
     // start a bare e-mail address (_a@b.co links whole in marked), so
     // try the e-mail match before treating it as a delimiter.
     if (cc === 42 || cc === 95 || cc === 126) { // * _ ~
-      if (cc === 95) {
+      if (cc === 95 && !inLink && !docInLink) {
         const em = tryGfmEmail(s, i);
         if (em) {
           flushText(i);
@@ -262,6 +272,11 @@ function parseInline(s, refs, inLink) {
       if (got) {
         flushText(i);
         items.push(got.item);
+        if (got.item.k === 'html') {
+          const tag = got.item.s;
+          if ((tag[1] === 'a' || tag[1] === 'A') && tag[2] === ' ') docInLink = true;
+          else if (tag[1] === '/' && (tag[2] === 'a' || tag[2] === 'A') && tag[3] === '>') docInLink = false;
+        }
         i = got.end;
         textStart = i;
         continue;
@@ -318,12 +333,14 @@ function parseInline(s, refs, inLink) {
       continue;
     }
     // GFM extended autolinks: www. / http(s):// / ftp:// / mailto: /
-    // xmpp: / bare e-mail. The boundary rules differ per form (probed
-    // against marked): schemes link anywhere, www. needs a boundary
-    // (start, whitespace, or one of ( * _ ~ [) or a fresh token
-    // position, mailto:/xmpp: need a non-alphanumeric before them, and
-    // bare e-mail matches wherever its pattern starts.
-    if ((cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) || (cc >= 48 && cc <= 57) || cc === 46 || cc === 43 || cc === 45) {
+    // xmpp: / bare e-mail. Suppressed inside a link's text and while
+    // an unclosed <a> tag leaks inLink across the document. The
+    // boundary rules differ per form (probed against marked): schemes
+    // link anywhere, www. needs a boundary (start, whitespace, or one
+    // of ( * _ ~ [) or a fresh token position, mailto:/xmpp: need a
+    // non-alphanumeric before them, and bare e-mail matches wherever
+    // its pattern starts.
+    if (!inLink && !docInLink && ((cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) || (cc >= 48 && cc <= 57) || cc === 46 || cc === 43 || cc === 45)) {
       const fresh = textStart === i && (items.length === 0 || items[items.length - 1].k !== 't');
       const got = tryGfmAutolink(s, i, fresh);
       if (got) {
@@ -479,6 +496,12 @@ function containsLink(text, refs) {
       const end = text.indexOf('`', i + 1);
       if (end > 0) { i = end; continue; }
     }
+    if (text[i] === '!' && text[i + 1] === '[') {
+      // A formed image is not a link: skip past it, so its label
+      // (e.g. the [6] in ![command][6]) is not mistaken for one.
+      const img = tryLink(text, i + 1, refs, true);
+      if (img) { i = img.end - 1; continue; }
+    }
     if (text[i] === '[' && text[i - 1] !== '!') {
       if (tryLink(text, i, refs, false)) return true;
     }
@@ -590,12 +613,17 @@ function tryLink(s, open, refs, isImg) {
   if (isImg) {
     // The alt text is the link text parsed as normal inline content
     // (links and images inside it do parse) and then stripped of tags
-    // — an inner image contributes its own alt text.
+    // — an inner image contributes its own alt text. A tag inside the
+    // alt text must not leak docInLink out (marked's De restores it).
+    const savedDocInLink = docInLink;
     const altKids = parseInline(rawText, refs, false);
+    docInLink = savedDocInLink;
     const alt = stripTags(renderItems(altKids));
     return { item: { k: 'img', src: encodeHref(dest), title: title === null ? null : escAttr(title), alt: escAttr(alt) }, end };
   }
+  const savedDocInLink = docInLink;
   const kids = parseInline(rawText, refs, true);
+  docInLink = savedDocInLink;
   return { item: { k: 'link', href: encodeHref(dest), title: title === null ? null : escAttr(title), kids }, end };
 }
 
@@ -2066,14 +2094,13 @@ function openItem(stack, ordered, startNum, wantDelim, indent, remainder, absMar
   let parent;
   let existingList = null;
   if (topNode.type === 'item') {
-    const p = stack[stack.length - 2];
-    if (p && p.type === 'list' && absMarkerCol === p.markerCol) {
-      stack.pop(); // sibling: close the current item, reuse its list
-      existingList = p;
-      parent = stack[stack.length - 2];
-    } else {
-      parent = topNode; // nested list under the open item
-    }
+    // A list line that reached this item matched it, so its marker
+    // sits at or beyond the item's content indent — marked's
+    // nextBulletRegex only treats a marker BELOW the item indent as
+    // a sibling, so this line always nests under the open item.
+    // (Siblings arrive with the list itself on top, after the item
+    // was closed for not matching.)
+    parent = topNode;
   } else if (topNode.type === 'list') {
     existingList = topNode;
     parent = stack[stack.length - 2];
