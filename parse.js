@@ -879,6 +879,49 @@ function curSkipSpaces(c, maxCols) {
 function curRest(c) {
   return ' '.repeat(c.pend) + c.s.slice(c.i);
 }
+// Does the cursor's remainder start with whitespace containing a tab?
+// Used to find the outermost container whose strip exposes a leading
+// tab: marked expands such tabs (from that level's columns) before
+// lexing the content, so the expansion base is the cursor column
+// before that strip.
+function restHasLeadingTab(c) {
+  let k = c.i;
+  while (k < c.s.length && (c.s[k] === ' ' || c.s[k] === '\t')) {
+    if (c.s[k] === '\t') return true;
+    k++;
+  }
+  return false;
+}
+// The cursor's remainder with leading tabs expanded to spaces, as
+// marked does when it extracts a container's content. `expandBase`
+// is the cursor column before the outermost strip that exposed a
+// leading tab (null when no container strip exposed one, in which
+// case the text is returned untouched — top-level lines keep their
+// literal tabs). Expansion starts at column (cur.col - expandBase):
+// the content's first character in the expansion level's text.
+function expandContent(cur, expandBase) {
+  const content = curRest(cur);
+  if (expandBase === null) return content;
+  let i = 0;
+  let hasTab = false;
+  while (i < content.length && (content[i] === ' ' || content[i] === '\t')) {
+    if (content[i] === '\t') { hasTab = true; break; }
+    i++;
+  }
+  if (!hasTab) return content;
+  let col = cur.col - expandBase;
+  let out = '';
+  let j = 0;
+  while (j < content.length && (content[j] === ' ' || content[j] === '\t')) {
+    if (content[j] === '\t') {
+      const w = 4 - (col % 4);
+      out += ' '.repeat(w);
+      col += w;
+    } else { out += ' '; col++; }
+    j++;
+  }
+  return out + content.slice(j);
+}
 function curIsBlank(c) {
   let i = c.i;
   if (c.pend > 0) return true;
@@ -1225,6 +1268,9 @@ function parseBlocks(src, refs) {
     let depth = 1; // stack index of the first container to match
     let allMatched = true;
     const blankNodes = [];
+    // Cursor column before the outermost strip that exposed a leading
+    // tab in the remainder (null when none did). Drives expandContent.
+    let expandBase = null;
     if (curIsBlank(cur)) blankNodes.push(stack[0]);
     while (depth < stack.length) {
       const node = stack[depth];
@@ -1238,9 +1284,11 @@ function parseBlocks(src, refs) {
         c2.i = cur.i; c2.col = cur.col; c2.pend = cur.pend;
         curSkipSpaces(c2, 3);
         if (curPeek(c2) === '>') {
+          const colBefore = cur.col;
           curAdvance(c2, 1);
           if (curPeek(c2) === ' ' || curPeek(c2) === '\t') curAdvance(c2, 1);
           cur.i = c2.i; cur.col = c2.col; cur.pend = c2.pend;
+          if (expandBase === null && restHasLeadingTab(cur)) expandBase = colBefore;
           if (curIsBlank(cur)) blankNodes.push(node);
           depth++;
           continue;
@@ -1252,7 +1300,9 @@ function parseBlocks(src, refs) {
         if (curIsBlank(cur)) {
           // A blank line consumes up to the item's content indent, so a
           // code block inside the item sees the remainder (usually '').
+          const colBefore = cur.col;
           curAdvance(cur, node.indent);
+          if (expandBase === null && restHasLeadingTab(cur)) expandBase = colBefore;
           blankNodes.push(node);
           depth++;
           continue;
@@ -1260,7 +1310,9 @@ function parseBlocks(src, refs) {
         const rest = curRest(cur);
         const ind = indentOf(rest, cur.col);
         if (ind.col >= node.indent) {
+          const colBefore = cur.col;
           curAdvance(cur, node.indent);
+          if (expandBase === null && restHasLeadingTab(cur)) expandBase = colBefore;
           if (curIsBlank(cur)) blankNodes.push(node);
           depth++;
           continue;
@@ -1270,7 +1322,7 @@ function parseBlocks(src, refs) {
       }
       break; // a leaf cannot be a container; stop
     }
-    return { depth, allMatched, cur, blankNodes };
+    return { depth, allMatched, cur, blankNodes, expandBase };
   }
 
   // Look ahead from the blank line at `li` to the next non-blank line.
@@ -1283,8 +1335,8 @@ function parseBlocks(src, refs) {
     while (j < lines.length && isBlankLine(lines[j])) j++;
     if (j >= lines.length) return null;
     const blanks = j - li;
-    const { depth, allMatched, cur } = matchContainers(lines[j]);
-    const content = curRest(cur);
+    const { depth, allMatched, cur, expandBase } = matchContainers(lines[j]);
+    const content = expandContent(cur, expandBase);
     const contentBase = cur.col;
     // A code line inside the same item: all containers matched and the
     // content starts with 4+ columns of indentation.
@@ -1312,26 +1364,39 @@ function parseBlocks(src, refs) {
     const raw = lines[li];
 
     // --- 1. Match open containers.
-    const { depth, allMatched, cur, blankNodes } = matchContainers(raw);
+    const { depth, allMatched, cur, blankNodes, expandBase } = matchContainers(raw);
 
-    const content = curRest(cur);
+    const content = expandContent(cur, expandBase);
     const contentBase = cur.col; // absolute column the content starts at
     const blank = isBlankLine(content);
 
-    // --- 2. Container mismatch: lazy paragraph continuation or close.
+    // --- 2. Container mismatch: lazy leaf continuation or close.
     if (!allMatched) {
       const para = tip && tip.type === 'paragraph' ? tip : null;
-      // A list-item line is never a lazy continuation when the paragraph
-      // sits inside a list item: the item has ended and the line starts
-      // a new item (an ordered list starting at 2 still opens a new
-      // list here — the "cannot interrupt a paragraph" rule only binds
-      // a paragraph at the same level). After a code-merged line, an
-      // outdented line does not lazily continue a paragraph inside a
-      // list item either — the item ends (in a blockquote it does).
+      // A line starting a block (heading, fence, HTML, HR, blockquote,
+      // or a list item when inside a list item) ends the containers;
+      // anything else may continue the open leaf lazily. A fenced code
+      // block or HTML block only absorbs a lazy line once it already
+      // has content (an opener alone does not); a table always does.
       const listLine = BULLET_RE.test(content) || ORDERED_RE.test(content);
       const inItem = stack.some((n) => n.type === 'item');
-      const lazy = para && !blank && !startsInterrupt(content, para) && !(listLine && inItem) && !(para.lastWasCodeMerge && para.inItem);
-      if (lazy) {
+      const bqLine = /^ {0,3}>/.test(content);
+      const blockStart = !blank && (startsInterrupt(content, para) || bqLine || (listLine && inItem));
+      // A fenced code block, HTML block or table absorbs a lazy line
+      // only when the tip sits inside a list item at or below the
+      // mismatch point: marked's blockquote tokenizer ends the quote
+      // when its last token is code/html/table, but re-lexes a list —
+      // so a fence in an item in a quote absorbs, while a fence
+      // directly in a quote (or in a quote in an item) does not.
+      let inListAtMismatch = false;
+      for (let k = depth; k < stack.length; k++) {
+        if (stack[k].type === 'item') { inListAtMismatch = true; break; }
+      }
+      // After a code-merged line, an outdented line does not lazily
+      // continue a paragraph inside a list item — the item ends (in a
+      // blockquote it does).
+      const lazyPara = para && !blank && !blockStart && !(para.lastWasCodeMerge && para.inItem);
+      if (lazyPara) {
         // Keep containers open; the line continues the paragraph.
         blankStack = null;
         const ind = indentOf(content, contentBase);
@@ -1369,6 +1434,28 @@ function parseBlocks(src, refs) {
           para.lines.push(SETEXT_RE.test(content) && para.lastWasLazy && parentIsBq ? '    ' + content : content);
           para.lastWasLazy = true;
         }
+        continue;
+      }
+      if (!blank && !blockStart && inListAtMismatch && tip && tip.type === 'code' && tip.fenced && tip.lines.length > 0) {
+        // Lazy fenced-code content: the line is kept unstripped (past
+        // the containers that did match), with the fence's own
+        // indentation stripped as usual.
+        blankStack = null;
+        tip.lines.push(stripFenceIndent(content, tip.fenceIndent || 0, tip.fenceChar === '`'));
+        continue;
+      }
+      if (!blank && !blockStart && inListAtMismatch && tip && tip.type === 'html' && tip.lines.length > 1) {
+        // Lazy HTML content.
+        blankStack = null;
+        tip.lines.push(content);
+        tip.endLine = li;
+        if (tip.htmlType <= 5 && htmlBlockEnd(tip.htmlType, content)) closeLeaf();
+        continue;
+      }
+      if (!blank && !blockStart && inListAtMismatch && tip && tip.type === 'table') {
+        // A lazy line after a table is another row.
+        blankStack = null;
+        tip.rows.push(splitTableRow(content));
         continue;
       }
       // Close unmatched containers (and the open leaf).
@@ -1925,8 +2012,12 @@ function tryOpenList(content, stack, tip, base, blankStack) {
     delim = m[2];
     markerText = m[1] + m[2];
   }
-  // A list interrupts a paragraph only under the usual conditions.
-  if (tip && tip.type === 'paragraph') {
+  // A list interrupts a paragraph only under the usual conditions —
+  // except inside a list item, where marked lexes the item text with
+  // state.top=false: the list tokenizer runs before the text
+  // tokenizer, so ANY list line (any start number, even an empty
+  // item) interrupts the paragraph and opens a nested list.
+  if (tip && tip.type === 'paragraph' && !tip.inItem) {
     const after = content.slice(m[0].length);
     if (after.trim() === '') return null;
     if (ordered && startNum !== 1) return null;
