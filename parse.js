@@ -1772,7 +1772,7 @@ function parseBlocks(src, refs) {
       }
       const stored = !refs[normLabel(label)];
       if (stored) refs[normLabel(label)] = { dest: res.dest, title: res.title };
-      if (res.maybeTitle && stored) pendingDef = { label: normLabel(label), rawLines };
+      if (res.maybeTitle) pendingDef = { label: normLabel(label), rawLines, stored };
       closeLeaf();
       lineWasDef = true;
       return;
@@ -1828,7 +1828,7 @@ function parseBlocks(src, refs) {
         } else {
           const stored = !refs[pendingLabel.label];
           if (stored) refs[pendingLabel.label] = { dest: res.dest, title: res.title };
-          if (res.maybeTitle && stored) pendingDef = { label: pendingLabel.label, rawLines: [...pendingLabel.raw, content] };
+          if (res.maybeTitle) pendingDef = { label: pendingLabel.label, rawLines: [...pendingLabel.raw, content], stored };
         }
         pendingLabel = null;
         lineWasDef = true;
@@ -1848,13 +1848,13 @@ function parseBlocks(src, refs) {
           // already registered (without a title); if the title fails
           // to close cleanly, the whole definition fails and must be
           // unregistered (flagged by `registered`).
-          pendingTitle = { label: pendingDef.label, dest: refs[pendingDef.label].dest, quote: t.partial.quote, buf: t.partial.text, rawLines: [...pendingDef.rawLines, content], registered: true };
+          pendingTitle = { label: pendingDef.label, dest: refs[pendingDef.label].dest, quote: t.partial.quote, buf: t.partial.text, rawLines: [...pendingDef.rawLines, content], registered: pendingDef.stored };
           pendingDef = null;
           lineWasDef = true;
           return;
         }
         const rec = refs[pendingDef.label];
-        if (rec) rec.title = decodeEntities(t);
+        if (rec && pendingDef.stored) rec.title = decodeEntities(t);
         pendingDef = null;
         lineWasDef = true;
         return;
@@ -2026,7 +2026,7 @@ function parseBlocks(src, refs) {
       } else {
         const stored = !refs[def.label];
         if (stored) refs[def.label] = { dest: def.dest, title: def.title };
-        if (def.maybeTitle && stored) pendingDef = { label: def.label, rawLines: [content] };
+        if (def.maybeTitle) pendingDef = { label: def.label, rawLines: [content], stored };
       }
       closeLeaf();
       lineWasDef = true;
