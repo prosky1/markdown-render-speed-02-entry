@@ -1487,10 +1487,7 @@ function parseBlocks(src, refs) {
       for (let k = depth; k < stack.length; k++) {
         if (stack[k].type === 'item') { inListAtMismatch = true; break; }
       }
-      // After a code-merged line, an outdented line does not lazily
-      // continue a paragraph inside a list item — the item ends (in a
-      // blockquote it does).
-      const lazyPara = para && !blank && !blockStart && !(para.lastWasCodeMerge && para.inItem);
+      const lazyPara = para && !blank && !blockStart;
       if (lazyPara) {
         // Keep containers open; the line continues the paragraph.
         blankStack = null;
@@ -1511,9 +1508,9 @@ function parseBlocks(src, refs) {
           para.lastWasCodeMerge = true;
           para.lastWasLazy = true;
         } else {
-          // A code-merged line followed by a non-code line contributes
-          // an extra empty line before it.
-          if (para.lastWasCodeMerge) { para.lines.push(''); para.noSetext = true; }
+          // A lazy non-code line after a code-merged line does NOT
+          // contribute an empty line (the '' rule applies only to
+          // lines that match the item container, in processContent).
           if (para.pendingBlanksAfterCode) {
             for (let k = 0; k < para.pendingBlanksAfterCode; k++) para.lines.push('');
             para.noSetext = true;
