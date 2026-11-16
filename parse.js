@@ -1381,7 +1381,17 @@ function parseBlocks(src, refs) {
         if (curPeek(c2) === '>') {
           const colBefore = cur.col;
           curAdvance(c2, 1);
-          if (curPeek(c2) === ' ' || curPeek(c2) === '\t') curAdvance(c2, 1);
+          if (curPeek(c2) === '\t') {
+            // A tab right after `>` is expanded from its column in
+            // the post-strip text (marked expands the marker
+            // whitespace first, then strips the marker plus one
+            // space), so the remainder starts with (width - 1)
+            // spaces where width is measured from the strip's frame,
+            // not the original line column.
+            const tabCol = c2.col - colBefore;
+            curAdvance(c2, 1);
+            c2.pend = (4 - (tabCol % 4)) - 1;
+          } else if (curPeek(c2) === ' ') curAdvance(c2, 1);
           cur.i = c2.i; cur.col = c2.col; cur.pend = c2.pend;
           if (expandBase === null && restHasLeadingTab(cur)) expandBase = colBefore;
           if (curIsBlank(cur)) blankNodes.push(node);
