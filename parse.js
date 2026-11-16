@@ -52,7 +52,7 @@ function isWhitespace(ch) {
 // code spans too). Text runs handed here never contain an entity
 // sequence: the inline scanner splits those out first.
 function escText(s) {
-  if (s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 && s.indexOf('"') < 0 && s.indexOf("'") < 0) return s;
+  if (!/[&<>"']/.test(s)) return s;
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 // Escape an attribute value: & < > ", but leave a valid entity reference
@@ -185,8 +185,11 @@ const TAG_NAME_RE = /^[A-Za-z][A-Za-z0-9-]*/;
 
 function parseInline(s, refs, inLink) {
   const n = s.length;
-  // The mask is only needed when an emphasis delimiter exists.
-  const masked = (s.indexOf('*') >= 0 || s.indexOf('_') >= 0 || s.indexOf('~') >= 0) ? maskEmStrong(s, refs) : s;
+  // The emphasis mask is computed lazily: only a delimiter that passes
+  // the left-delimiter gate needs it, and most paragraphs with a stray
+  // * or _ never do.
+  let masked = null;
+  const getMasked = () => masked !== null ? masked : (masked = maskEmStrong(s, refs));
   let out = '';
   let i = 0;
   let textStart = 0;
@@ -246,9 +249,13 @@ function parseInline(s, refs, inLink) {
     // (_a@b.co links whole in marked), so try the e-mail match after
     // the emphasis attempt fails — marked tries emStrong first.
     if (cc === 42 || cc === 95) { // * _
-      const got = tryEmStrong(s, masked, i, refs, inLink, prevCharAt(i));
+      // Cheap left-delimiter gate first: only a run that can open
+      // emphasis needs the (expensive) mask.
+      EM_STRONG_LDELIM_RE.lastIndex = i;
+      const ldm = EM_STRONG_LDELIM_RE.exec(s);
+      const got = (ldm && (ldm[1] || ldm[2] || ldm[3] || ldm[4])) ? tryEmStrong(s, getMasked(), i, refs, inLink, prevCharAt(i)) : null;
       if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
-      if (cc === 95 && !inLink && !docInLink) {
+      if (cc === 95 && !inLink && !docInLink && (textStart === i || !isEmailLocalChar(i > 0 ? s.charCodeAt(i - 1) : -1))) {
         const em = tryGfmEmail(s, i);
         if (em) { flushText(i); out += em.html; lastWasText = false; i = em.end; textStart = i; continue; }
       }
@@ -257,7 +264,8 @@ function parseInline(s, refs, inLink) {
     }
     // Strikethrough.
     if (cc === 126) { // ~
-      const got = tryDel(s, masked, i, refs, inLink, prevCharAt(i));
+      DEL_LDELIM_RE.lastIndex = i;
+      const got = DEL_LDELIM_RE.exec(s) ? tryDel(s, getMasked(), i, refs, inLink, prevCharAt(i)) : null;
       if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
       i++;
       continue;
@@ -333,7 +341,14 @@ function parseInline(s, refs, inLink) {
     // its pattern starts.
     if (!inLink && !docInLink && ((cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) || (cc >= 48 && cc <= 57) || cc === 46 || cc === 43 || cc === 45)) {
       const fresh = textStart === i && !lastWasText;
-      const got = tryGfmAutolink(s, i, fresh);
+      // A bare e-mail's local part is a maximal run of [A-Za-z0-9._+-]:
+      // the e-mail regex only needs trying at the run's start (a later
+      // position in the same run shares the @ and domain, so it cannot
+      // succeed where the run start failed). The run starts here when
+      // the previous character is not a local-part character, or when
+      // a token just ended (the run's start was inside the token).
+      const tryEmail = textStart === i || !isEmailLocalChar(i > 0 ? s.charCodeAt(i - 1) : -1);
+      const got = tryGfmAutolink(s, i, fresh, tryEmail);
       if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
       i++;
       continue;
@@ -360,13 +375,18 @@ const EM_STRONG_LDELIM_RE = /(?:\*+(?:((?!\*)(?!~)[\p{P}\p{S}])|([^\s*]))?)|_+(?
 // a group — 1/2 closer-only, 3/4 opener-only, 5/6 both (the _ rule
 // has no group 6: an intraword _ is never a delimiter). The leading
 // alternatives skip plain text and a **..._...** / __...*...__ span.
-const EM_STRONG_RDELIM_AST_RE = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
-const EM_STRONG_RDELIM_UND_RE = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
+const EM_STRONG_RDELIM_AST_RE = /[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
+const EM_STRONG_RDELIM_UND_RE = /[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
+// Leading skip alternatives (run once at the scan start, sticky):
+// a __...*...__ span when scanning for * closers, a **..._...**
+// span when scanning for _ closers.
+const EM_STRONG_SKIP_AST_RE = /[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/y;
+const EM_STRONG_SKIP_UND_RE = /[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/y;
 // Strikethrough delimiters: the left rule needs a following
 // character (a lone ~ at the end is literal); the right rule mirrors
 // the emphasis one with 1-2 tildes per run.
 const DEL_LDELIM_RE = /~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/uy;
-const DEL_RDELIM_RE = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
+const DEL_RDELIM_RE = /[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
 
 // Try emphasis/strong at position i of s. `masked` is the masked copy
 // of the whole text (same length), `prevChar` is marked's `r`.
@@ -399,10 +419,17 @@ function tryEmStrong(s, masked, i, refs, inLink, prevChar) {
     const R = p.trim() !== '' && (!!d || (r === '*' && !h));
     if (r !== '*' && r !== '_') return null;
     const A = r === '*' ? EM_STRONG_RDELIM_AST_RE : EM_STRONG_RDELIM_UND_RE;
-    const scan = masked.slice(off + k);
-    A.lastIndex = 0;
+    // The scan runs on the full masked text (no slice): the leading
+    // skip alternative is tried once at the scan start, then the main
+    // regex runs from there. Match indices are absolute.
+    const skipRe = r === '*' ? EM_STRONG_SKIP_AST_RE : EM_STRONG_SKIP_UND_RE;
+    let scanStart = off + k;
+    skipRe.lastIndex = scanStart;
+    const sk = skipRe.exec(masked);
+    if (sk) scanStart += sk[0].length;
+    A.lastIndex = scanStart;
     let sm;
-    while ((sm = A.exec(scan)) !== null) {
+    while ((sm = A.exec(masked)) !== null) {
       const g = sm[1] || sm[2] || sm[3] || sm[4] || sm[5] || sm[6];
       if (!g) continue;
       const b = [...g].length;
@@ -415,7 +442,7 @@ function tryEmStrong(s, masked, i, refs, inLink, prevChar) {
       if (m > 0) continue;
       const use = Math.min(b, b + m + f);
       const te = sm[0].codePointAt(0) > 0xFFFF ? 2 : 1;
-      const rawEnd = i + k + sm.index + te + use;
+      const rawEnd = sm.index + te + use;
       const M = s.slice(i, rawEnd);
       if (Math.min(k, use) % 2 === 1) {
         return { html: '<em>' + parseInline(M.slice(1, -1), refs, inLink) + '</em>', end: rawEnd };
@@ -437,10 +464,9 @@ function tryDel(s, masked, i, refs, inLink, prevChar) {
   if (!(ldm[1] || '') || !n || NT_PUNCT_RE.test(n)) {
     const o = [...ldm[0]].length - 1;
     let p = o;
-    const scan = masked.slice(i + o);
-    DEL_RDELIM_RE.lastIndex = 0;
+    DEL_RDELIM_RE.lastIndex = i + o;
     let sm;
-    while ((sm = DEL_RDELIM_RE.exec(scan)) !== null) {
+    while ((sm = DEL_RDELIM_RE.exec(masked)) !== null) {
       const g = sm[1] || sm[2] || sm[3] || sm[4] || sm[5] || sm[6];
       if (!g) continue;
       const l = [...g].length;
@@ -450,7 +476,7 @@ function tryDel(s, masked, i, refs, inLink, prevChar) {
       if (p > 0) continue;
       const use = Math.min(l, l + p);
       const te = sm[0].codePointAt(0) > 0xFFFF ? 2 : 1;
-      const rawEnd = i + o + sm.index + te + use;
+      const rawEnd = sm.index + te + use;
       const M = s.slice(i, rawEnd);
       return { html: '<del>' + parseInline(M.slice(o, -o), refs, inLink) + '</del>', end: rawEnd };
     }
@@ -485,9 +511,16 @@ function linkInText(e, refs) {
   return false;
 }
 
+// Is char code `cc` an e-mail local-part character [A-Za-z0-9._+-]?
+function isEmailLocalChar(cc) {
+  return (cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) || (cc >= 48 && cc <= 57) || cc === 46 || cc === 95 || cc === 43 || cc === 45;
+}
+
 function maskEmStrong(s, refs) {
   let t = s;
-  if (refs && s.includes('[')) {
+  const hasBracket = s.includes('[');
+  const hasBacktick = s.includes('`');
+  if (refs && hasBracket) {
     const maskReflink = (r) => {
       const o = r.lastIndexOf('[');
       if (!Object.hasOwn(refs, normLabel(r.slice(o + 1, -1)))) return r;
@@ -499,8 +532,12 @@ function maskEmStrong(s, refs) {
     };
     t = t.replace(REFLINK_SEARCH_RE, maskReflink);
   }
-  t = t.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (n, s1, r1) => r1 ? '+'.repeat(n.length) : s1 ? s1 + n.slice(s1.length, -s1.length).replace(/`/g, '+') + s1 : n);
-  t = t.replace(BLOCK_SKIP_RE, (n, s1, r1) => { const o = r1 ? r1.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
+  // The punctuation pass only matches code spans (backtick) or escaped
+  // punctuation (backslash); the block-skip pass only matches link
+  // spans ([), code spans (backtick) or tags (<). Skip a pass when the
+  // text provably contains nothing it can match.
+  if (hasBacktick || s.includes('\\')) t = t.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (n, s1, r1) => r1 ? '+'.repeat(n.length) : s1 ? s1 + n.slice(s1.length, -s1.length).replace(/`/g, '+') + s1 : n);
+  if (hasBracket || hasBacktick || s.includes('<')) t = t.replace(BLOCK_SKIP_RE, (n, s1, r1) => { const o = r1 ? r1.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
   return t;
 }
 
@@ -864,10 +901,10 @@ function tryAngle(s, i) {
 // (a dot is NOT required: www.foo links), then any run of non-space,
 // non-< characters. The e-mail pattern's trailing (?![\w-]) lookahead
 // is what makes a.b-c_d@a.b- stay literal while a.b-c_d@a.b. links.
-const GFM_SCHEME_RE = /^(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/;
-const GFM_WWW_RE = /^www\.(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/;
-const GFM_EMAIL_RE = /^[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
-const GFM_MAILTO_RE = /^(?:mailto:|xmpp:)[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?/;
+const GFM_SCHEME_RE = /(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
+const GFM_WWW_RE = /www\.(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
+const GFM_EMAIL_RE = /[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/y;
+const GFM_MAILTO_RE = /(?:mailto:|xmpp:)[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?/y;
 // Trailing-punctuation trim for autolinks (marked's "backpedal"):
 // the kept prefix is built from safe chunks — runs of characters that
 // are not trailing punctuation, balanced (...) groups, and & not
@@ -891,40 +928,58 @@ function trimAutolinkEnd(url) {
 // follows a non-text token (a code span, link, tag, break or delimiter
 // run), which counts as a word boundary for www. Returns {html, end}
 // or null.
-function tryGfmAutolink(s, i, fresh) {
-  const rest = s.slice(i);
+function tryGfmAutolink(s, i, fresh, tryEmail) {
+  const c = s[i];
   const prev = i > 0 ? s[i - 1] : '';
   // mailto: / xmpp: (lowercase only) need a non-alphanumeric before
   // them, so xmailto: is not a scheme (its bare e-mail still links).
-  if ((rest.startsWith('mailto:') || rest.startsWith('xmpp:')) && (prev === '' || !/[A-Za-z0-9]/.test(prev))) {
-    const m = GFM_MAILTO_RE.exec(rest);
+  if ((c === 'm' || c === 'x') && (s.startsWith('mailto:', i) || s.startsWith('xmpp:', i)) && (prev === '' || !/[A-Za-z0-9]/.test(prev))) {
+    GFM_MAILTO_RE.lastIndex = i;
+    const mm = GFM_MAILTO_RE.exec(s);
+    if (mm) {
+      const url = trimAutolinkEnd(mm[0]);
+      if (url) return { html: '<a href="' + escAttr(encodeHref(url)) + '">' + escText(url) + '</a>', end: i + url.length };
+    }
+  }
+  // http(s):// and ftp:// link anywhere, even mid-word (xhttp://...).
+  if (c === 'h' || c === 'H' || c === 'f' || c === 'F') {
+    GFM_SCHEME_RE.lastIndex = i;
+    const m = GFM_SCHEME_RE.exec(s);
     if (m) {
       const url = trimAutolinkEnd(m[0]);
       if (url) return { html: '<a href="' + escAttr(encodeHref(url)) + '">' + escText(url) + '</a>', end: i + url.length };
     }
   }
-  // http(s):// and ftp:// link anywhere, even mid-word (xhttp://...).
-  let m = GFM_SCHEME_RE.exec(rest);
-  if (m) {
-    const url = trimAutolinkEnd(m[0]);
-    if (url) return { html: '<a href="' + escAttr(encodeHref(url)) + '">' + escText(url) + '</a>', end: i + url.length };
-  }
   // www. needs a boundary: start, whitespace, ( * _ ~ [, or a fresh
   // token position. After " ! . : / { } ; and the like it stays text.
-  if (rest.startsWith('www.') && (fresh || prev === '' || prev === ' ' || prev === '\t' || prev === '\n' || prev === '(' || prev === '*' || prev === '_' || prev === '~' || prev === '[')) {
-    m = GFM_WWW_RE.exec(rest);
+  if (c === 'w' && s.startsWith('www.', i) && (fresh || prev === '' || prev === ' ' || prev === '\t' || prev === '\n' || prev === '(' || prev === '*' || prev === '_' || prev === '~' || prev === '[')) {
+    GFM_WWW_RE.lastIndex = i;
+    const m = GFM_WWW_RE.exec(s);
     if (m) {
       const url = trimAutolinkEnd(m[0]);
       if (url) return { html: '<a href="' + escAttr(encodeHref('http://' + url)) + '">' + escText(url) + '</a>', end: i + url.length };
     }
   }
-  return tryGfmEmail(s, i);
+  if (tryEmail) return tryGfmEmail(s, i);
+  return null;
 }
 
 // Bare e-mail autolink at position i. The pattern itself rejects a
 // trailing - or _ (the (?![\w-]) lookahead), so a.b-c_d@a.b- is literal.
 function tryGfmEmail(s, i) {
-  const m = GFM_EMAIL_RE.exec(s.slice(i));
+  // Cheap pre-check: the local part must reach an @. Scan the
+  // local-part run; if it ends before any @, no e-mail starts here.
+  let j = i;
+  const n = s.length;
+  while (j < n) {
+    const cc = s.charCodeAt(j);
+    if (cc === 64) break; // @
+    if (!isEmailLocalChar(cc)) return null;
+    j++;
+  }
+  if (j >= n) return null;
+  GFM_EMAIL_RE.lastIndex = i;
+  const m = GFM_EMAIL_RE.exec(s);
   if (m) {
     const email = m[0];
     return { html: '<a href="mailto:' + email + '">' + escText(email) + '</a>', end: i + email.length };
@@ -2193,6 +2248,14 @@ function openItem(stack, ordered, startNum, wantDelim, indent, remainder, absMar
   }
   let list = null;
   if (existingList && existingList.ordered === ordered && existingList.delim === wantDelim) list = existingList;
+  if (!list && existingList) {
+    // The open list is finished (different bullet/delimiter): pop it
+    // and any stale lists below it. A new list's parent is the first
+    // non-list container under them — a list pushed as a child of
+    // another list is never rendered.
+    while (stack.length > 1 && stack[stack.length - 1].type === 'list') stack.pop();
+    parent = stack[stack.length - 1];
+  }
   if (!list && parent.type === 'item' && parent.children.length > 0) {
     // Reuse a previously closed nested list under this item.
     const last = parent.children[parent.children.length - 1];
