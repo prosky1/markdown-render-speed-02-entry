@@ -1605,6 +1605,15 @@ function parseBlocks(src, refs) {
         pendingLabel = null;
       }
       if (pendingDef) pendingDef = null;
+      if (tip && tip.type === 'table' && content !== '' && !/^ *$/.test(content) && !(li === lines.length - 1 && !src.endsWith('\n'))) {
+        // A whitespace-only line that is not spaces-only (it holds a
+        // tab) is a table row, not a blank line: marked's table body
+        // excludes only empty and spaces-only lines. The one exception
+        // is a trailing tab-only line at EOF without a newline, which
+        // marked's tableRowBlankLine strips.
+        tip.rows.push(splitTableRow(content));
+        continue;
+      }
       if (tip && tip.type === 'code') {
         // A blank line inside fenced code keeps its content past the
         // fence's indentation; inside indented code it keeps the spaces
