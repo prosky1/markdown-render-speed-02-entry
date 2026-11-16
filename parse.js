@@ -385,27 +385,54 @@ function findCodeClose(s, from, len) {
 }
 
 // Find the index of the `]` matching the `[` at `open` (depth-aware,
-// skipping code spans and backslash escapes). -1 when there is none.
+// skipping backslash escapes). Backticks follow marked's label
+// pattern: a backtick run must form a complete code span (the closing
+// run need not match the opening run's length) or sit immediately
+// before the closing `]` — an unclosed backtick anywhere else makes
+// the whole label fail. The span closer is backtracked: the first
+// (shortest-content) closer is tried first, then later ones.
 function findLinkEnd(s, open) {
+  return scanLabel(s, open + 1, 1);
+}
+
+function scanLabel(s, i, depth) {
   const n = s.length;
-  let depth = 1;
-  let i = open + 1;
   while (i < n) {
     const c = s[i];
     if (c === '\\' && i + 1 < n) { i += 2; continue; }
+    if (c === '[') { depth++; i++; continue; }
+    if (c === ']') {
+      depth--;
+      if (depth === 0) return i;
+      i++;
+      continue;
+    }
     if (c === '`') {
       let j = i;
       while (j < n && s[j] === '`') j++;
-      const len = j - i;
-      const close = findCodeClose(s, j, len);
-      if (close < 0) return -1;
-      i = close + len;
-      continue;
-    }
-    if (c === '[') depth++;
-    else if (c === ']') {
-      depth--;
-      if (depth === 0) return i;
+      // Try each later backtick run as the span closer, shortest
+      // content first.
+      let k = j;
+      while (k < n) {
+        const nb = s.indexOf('`', k);
+        if (nb < 0) break;
+        let m = nb;
+        while (m < n && s[m] === '`') m++;
+        const r = scanLabel(s, m, depth);
+        if (r >= 0) return r;
+        k = m;
+      }
+      // No span closer worked: the run is only valid immediately
+      // before a ] when it is TWO or more backticks (marked's
+      // alternative is `` ``+(?=\]) `` — a single backtick there
+      // fails the whole label).
+      if (j - i >= 2 && j < n && s[j] === ']') {
+        depth--;
+        if (depth === 0) return j;
+        i = j + 1;
+        continue;
+      }
+      return -1;
     }
     i++;
   }
