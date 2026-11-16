@@ -553,19 +553,20 @@ function scanLabel(s, i, depth) {
     if (c === '`') {
       let j = i;
       while (j < n && s[j] === '`') j++;
-      // The span closer is the NEXT backtick run: the pattern's
-      // content [^`]*? cannot hold a backtick, so there is no choice
-      // to backtrack over.
+      // A backtick run is either a code span (its closer is the NEXT
+      // backtick run — the span content cannot hold a backtick) or,
+      // when it sits immediately before a ] as two or more backticks,
+      // a trailing run. The span is tried first, but if it leads
+      // nowhere (its closer may sit past the label's ]), the scan
+      // backtracks to the trailing alternative — marked's label
+      // pattern does the same.
       const nb = s.indexOf('`', j);
       if (nb >= 0) {
         let m = nb;
         while (m < n && s[m] === '`') m++;
-        i = m;
-        continue;
+        const r = scanLabel(s, m, depth);
+        if (r >= 0) return r;
       }
-      // No closer: the run is only valid immediately before a ] when
-      // it is TWO or more backticks (marked's alternative is
-      // `` ``+(?=\]) `` — a single backtick there fails the label).
       if (j - i >= 2 && j < n && s[j] === ']') {
         depth--;
         if (depth === 0) return j;
