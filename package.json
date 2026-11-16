@@ -1,1 +1,1 @@
-{"type":"module"}
+{"description":"Drop-in replacement for marked 18.1.3, written from scratch (single-session rebuild).","license":"MIT","main":"parse.js","name":"markdown-render-speed-02-entry","type":"module","version":"2.0.0"}
