@@ -170,21 +170,43 @@ const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]{1,31}:/;
 const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
 const TAG_NAME_RE = /^[A-Za-z][A-Za-z0-9-]*/;
 
+// ---------------------------------------------------------------- inline
+//
+// Inline parsing follows marked's left-to-right recursive tokenizer:
+// at each position the tokenizers are tried in order (escape, tag,
+// link, emphasis, code span, break, strikethrough, autolink, GFM
+// autolink) and the first match wins; emphasis and strikethrough
+// contents are parsed by a recursive call, so an e-mail inside
+// __...__ is matched after the strong span has formed (its trailing
+// __ is gone by then). Emphasis scanning runs on a MASKED copy of the
+// text (maskEmStrong) in which link spans, code spans and HTML tags
+// are replaced by [aaa...], so delimiters inside a (possibly failed)
+// link span are invisible to the scan.
+
 function parseInline(s, refs, inLink) {
-  const items = [];
-  const delims = [];
   const n = s.length;
+  // The mask is only needed when an emphasis delimiter exists.
+  const masked = (s.indexOf('*') >= 0 || s.indexOf('_') >= 0 || s.indexOf('~') >= 0) ? maskEmStrong(s, refs) : s;
+  let out = '';
   let i = 0;
   let textStart = 0;
+  // lastWasText / prevR track marked's `r` (the previous character
+  // handed to the emphasis tokenizers): the last character of the
+  // preceding text token, or '' when the preceding token was not text
+  // — and a text token ending in _ does not update it.
+  let lastWasText = false;
+  let prevR = '';
   const flushText = (end) => {
-    if (end > textStart) items.push({ k: 't', s: escText(s.slice(textStart, end)) });
+    if (end > textStart) {
+      out += escText(s.slice(textStart, end));
+      prevR = s[end - 1] !== '_' ? s[end - 1] : (lastWasText ? prevR : '');
+      lastWasText = true;
+    }
   };
-  const pushDelim = (ch, start, len, open, close) => {
-    const d = { k: 'd', ch, n: len, open, close, start };
-    items.push(d);
-    delims.push(d);
-    return d;
-  };
+  // The `r` value for a tokenizer attempt at position i: the last
+  // character of the pending text run, falling back to the last
+  // emitted text token when the run is empty or ends in _.
+  const prevCharAt = (pos) => pos > textStart ? (s[pos - 1] !== '_' ? s[pos - 1] : (lastWasText ? prevR : '')) : (lastWasText ? prevR : '');
 
   while (i < n) {
     const c = s[i];
@@ -194,8 +216,8 @@ function parseInline(s, refs, inLink) {
     // follows it (marked's br rule carries a (?!\s*$) lookahead).
     if (cc === 92) { // backslash
       const nx = s[i + 1];
-      if (nx === '\n' && !restIsAllWs(s, i + 2)) { flushText(i); items.push({ k: 'br' }); i += 2; while (i < n && (s[i] === ' ' || s[i] === '\t')) i++; textStart = i; continue; }
-      if (nx && isAsciiPunct(nx)) { flushText(i); items.push({ k: 't', s: escText(nx) }); i += 2; textStart = i; continue; }
+      if (nx === '\n' && !restIsAllWs(s, i + 2)) { flushText(i); out += '<br>'; lastWasText = false; i += 2; while (i < n && (s[i] === ' ' || s[i] === '\t')) i++; textStart = i; continue; }
+      if (nx && isAsciiPunct(nx)) { flushText(i); out += escText(nx); if (nx !== '_') prevR = nx; lastWasText = true; i += 2; textStart = i; continue; }
       i++;
       continue;
     }
@@ -211,7 +233,8 @@ function parseInline(s, refs, inLink) {
           content = content.slice(1, -1);
         }
         flushText(i);
-        items.push({ k: 'code', s: escText(content) });
+        out += '<code>' + escText(content) + '</code>';
+        lastWasText = false;
         i = close + len;
         textStart = i;
         continue;
@@ -219,50 +242,30 @@ function parseInline(s, refs, inLink) {
       i = j;
       continue;
     }
-    // Emphasis / strikethrough delimiter runs. A leading `_` can also
-    // start a bare e-mail address (_a@b.co links whole in marked), so
-    // try the e-mail match before treating it as a delimiter.
-    if (cc === 42 || cc === 95 || cc === 126) { // * _ ~
+    // Emphasis. A leading `_` can also start a bare e-mail address
+    // (_a@b.co links whole in marked), so try the e-mail match after
+    // the emphasis attempt fails — marked tries emStrong first.
+    if (cc === 42 || cc === 95) { // * _
+      const got = tryEmStrong(s, masked, i, refs, inLink, prevCharAt(i));
+      if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
       if (cc === 95 && !inLink && !docInLink) {
         const em = tryGfmEmail(s, i);
-        if (em) {
-          flushText(i);
-          items.push(em.item);
-          i = em.end;
-          textStart = i;
-          continue;
-        }
-      }      const ch = c;
-      let j = i;
-      while (j < n && s[j] === ch) j++;
-      const len = j - i;
-      const prev = i > 0 ? s[i - 1] : '';
-      const next = j < n ? s[j] : '';
-      const leftFlank = next !== '' && !isSpace(next) && (!isPunct(next) || prev === '' || isSpace(prev) || isPunct(prev));
-      const rightFlank = prev !== '' && !isSpace(prev) && (!isPunct(prev) || next === '' || isSpace(next) || isPunct(next));
-      let open, close;
-      if (ch === '_') {
-        open = leftFlank && (!rightFlank || prev === '' || isSpace(prev) || isPunct(prev));
-        close = rightFlank && (!leftFlank || next === '' || isSpace(next) || isPunct(next));
-      } else {
-        open = leftFlank;
-        close = rightFlank;
+        if (em) { flushText(i); out += em.html; lastWasText = false; i = em.end; textStart = i; continue; }
       }
-      if (ch === '~' && len < 1) { i = j; continue; }
-      if (open || close) {
-        flushText(i);
-        pushDelim(ch, i, len, open, close);
-        i = j;
-        textStart = i;
-        continue;
-      }
-      i = j;
+      i++;
+      continue;
+    }
+    // Strikethrough.
+    if (cc === 126) { // ~
+      const got = tryDel(s, masked, i, refs, inLink, prevCharAt(i));
+      if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
+      i++;
       continue;
     }
     // Entity reference.
     if (cc === 38) { // &
       const m = entityAt(s, i);
-      if (m) { flushText(i); items.push({ k: 't', s: m.numeric ? escText(m.text) : m.text }); i += m.len; textStart = i; continue; }
+      if (m) { flushText(i); out += m.numeric ? escText(m.text) : m.text; const lc = s[i + m.len - 1]; if (lc !== '_') prevR = lc; lastWasText = true; i += m.len; textStart = i; continue; }
       i++;
       continue;
     }
@@ -271,9 +274,10 @@ function parseInline(s, refs, inLink) {
       const got = tryAngle(s, i, refs);
       if (got) {
         flushText(i);
-        items.push(got.item);
-        if (got.item.k === 'html') {
-          const tag = got.item.s;
+        out += got.html;
+        lastWasText = false;
+        if (got.isHtmlTag) {
+          const tag = got.html;
           if ((tag[1] === 'a' || tag[1] === 'A') && tag[2] === ' ') docInLink = true;
           else if (tag[1] === '/' && (tag[2] === 'a' || tag[2] === 'A') && tag[3] === '>') docInLink = false;
         }
@@ -288,48 +292,35 @@ function parseInline(s, refs, inLink) {
     // link, so ![ is allowed inside a link but [ is not.
     if (cc === 91 && !inLink) { // [
       const got = tryLink(s, i, refs, false);
-      if (got) {
-        flushText(i);
-        items.push(got.item);
-        i = got.end;
-        textStart = i;
-        continue;
-      }
+      if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
       i++;
       continue;
     }
     if (cc === 33 && s[i + 1] === '[') { // ![
       const got = tryLink(s, i + 1, refs, true);
-      if (got) {
-        flushText(i);
-        items.push(got.item);
-        i = got.end;
-        textStart = i;
-        continue;
-      }
+      if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
       i++;
       continue;
     }
-    // Newline: hard break (2+ trailing spaces or backslash handled above)
-    // or soft break. After a hard break the next line's leading spaces
-    // and tabs are stripped; a hard break at the very end of the text
-    // (only whitespace follows) is not a break at all.
+    // Newline: hard break (2+ trailing spaces) or soft break. After a
+    // hard break the next line's leading spaces and tabs are stripped;
+    // a hard break at the very end of the text (only whitespace
+    // follows) is not a break at all. A soft break is just a newline
+    // in the text run.
     if (cc === 10) { // \n
       let k = i - 1;
       let spaces = 0;
       while (k >= textStart && s[k] === ' ') { spaces++; k--; }
       if (spaces >= 2 && !restIsAllWs(s, i + 1)) {
         flushText(k + 1);
-        items.push({ k: 'br' });
+        out += '<br>';
+        lastWasText = false;
         i++;
         while (i < n && (s[i] === ' ' || s[i] === '\t')) i++;
         textStart = i;
         continue;
       }
-      flushText(i);
-      items.push({ k: 't', s: '\n' });
       i++;
-      textStart = i;
       continue;
     }
     // GFM extended autolinks: www. / http(s):// / ftp:// / mailto: /
@@ -341,23 +332,176 @@ function parseInline(s, refs, inLink) {
     // non-alphanumeric before them, and bare e-mail matches wherever
     // its pattern starts.
     if (!inLink && !docInLink && ((cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) || (cc >= 48 && cc <= 57) || cc === 46 || cc === 43 || cc === 45)) {
-      const fresh = textStart === i && (items.length === 0 || items[items.length - 1].k !== 't');
+      const fresh = textStart === i && !lastWasText;
       const got = tryGfmAutolink(s, i, fresh);
-      if (got) {
-        flushText(i);
-        items.push(got.item);
-        i = got.end;
-        textStart = i;
-        continue;
-      }
+      if (got) { flushText(i); out += got.html; lastWasText = false; i = got.end; textStart = i; continue; }
       i++;
       continue;
     }
     i++;
   }
   flushText(n);
-  processEmphasis(items, delims);
-  return items;
+  return out;
+}
+
+// Emphasis masks and scanners (marked's emStrong/del tokenizers).
+// Punctuation classes: CommonMark punct is Unicode P or S; the GFM
+// variants treat ~ as a non-punctuation character (it is a delimiter
+// of its own). NT_PUNCT_RE is marked's `punctuation` rule: a
+// whitespace-or-punctuation character other than * or _.
+const NT_PUNCT_RE = /^((?![*_])[\s\p{P}\p{S}])/u;
+const ALNUM_RE = /[\p{L}\p{N}]/u;
+// Left-delimiter rule (GFM): a run of * or _ plus the following
+// character — group 1/3 is punctuation after the run, group 2/4 is a
+// non-space character. Sticky: exec with lastIndex at the opener.
+const EM_STRONG_LDELIM_RE = /(?:\*+(?:((?!\*)(?!~)[\p{P}\p{S}])|([^\s*]))?)|_+(?:((?!_)(?!~)[\p{P}\p{S}])|([^\s_]))?/uy;
+// Right-delimiter rules (GFM for *, CommonMark for _): each
+// alternative consumes the character before the run, then the run in
+// a group — 1/2 closer-only, 3/4 opener-only, 5/6 both (the _ rule
+// has no group 6: an intraword _ is never a delimiter). The leading
+// alternatives skip plain text and a **..._...** / __...*...__ span.
+const EM_STRONG_RDELIM_AST_RE = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
+const EM_STRONG_RDELIM_UND_RE = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
+// Strikethrough delimiters: the left rule needs a following
+// character (a lone ~ at the end is literal); the right rule mirrors
+// the emphasis one with 1-2 tildes per run.
+const DEL_LDELIM_RE = /~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/uy;
+const DEL_RDELIM_RE = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
+
+// Try emphasis/strong at position i of s. `masked` is the masked copy
+// of the whole text (same length), `prevChar` is marked's `r`.
+// Returns {html, end} or null. Marked's scan is a left-to-right walk
+// with an m counter (opener length, plus opener-only runs, minus
+// closer runs) and an f counter (length skipped by the rule of 3);
+// the span forms when m reaches 0.
+function tryEmStrong(s, masked, i, refs, inLink, prevChar) {
+  EM_STRONG_LDELIM_RE.lastIndex = i;
+  const ldm = EM_STRONG_LDELIM_RE.exec(s);
+  if (!ldm || (!ldm[1] && !ldm[2] && !ldm[3] && !ldm[4])) return null;
+  const r = ldm[0][0];
+  let n = prevChar;
+  const o = n === r;
+  const off = i;
+  let l = off;
+  while (l > 0 && masked[l - 1] === r) l--;
+  const pSlice = masked.slice(Math.max(0, l - 2), l);
+  const p = pSlice ? [...pSlice].at(-1) : '';
+  const h = p === '*' || p === '_' || NT_PUNCT_RE.test(p);
+  if (l < off) n = p;
+  const u = l < off ? h : NT_PUNCT_RE.test(n);
+  if (ldm[4] && ALNUM_RE.test(n)) return null;
+  const d = ldm[1] || ldm[3] || '';
+  if (!d || !n || u) {
+    const k = [...ldm[0]].length - 1;
+    let m = k;
+    let f = 0;
+    const y = off - l + k;
+    const R = p.trim() !== '' && (!!d || (r === '*' && !h));
+    if (r !== '*' && r !== '_') return null;
+    const A = r === '*' ? EM_STRONG_RDELIM_AST_RE : EM_STRONG_RDELIM_UND_RE;
+    const scan = masked.slice(off + k);
+    A.lastIndex = 0;
+    let sm;
+    while ((sm = A.exec(scan)) !== null) {
+      const g = sm[1] || sm[2] || sm[3] || sm[4] || sm[5] || sm[6];
+      if (!g) continue;
+      const b = [...g].length;
+      if (sm[3] || sm[4]) { m += b; continue; }
+      else if (sm[5] || sm[6] || R) {
+        if (o && (sm[5] || sm[6])) break;
+        if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      const use = Math.min(b, b + m + f);
+      const te = sm[0].codePointAt(0) > 0xFFFF ? 2 : 1;
+      const rawEnd = i + k + sm.index + te + use;
+      const M = s.slice(i, rawEnd);
+      if (Math.min(k, use) % 2 === 1) {
+        return { html: '<em>' + parseInline(M.slice(1, -1), refs, inLink) + '</em>', end: rawEnd };
+      }
+      return { html: '<strong>' + parseInline(M.slice(2, -2), refs, inLink) + '</strong>', end: rawEnd };
+    }
+  }
+  return null;
+}
+
+// Try strikethrough at position i of s. Same shape as tryEmStrong but
+// a closer must have exactly the opener's length and there is no rule
+// of 3.
+function tryDel(s, masked, i, refs, inLink, prevChar) {
+  DEL_LDELIM_RE.lastIndex = i;
+  const ldm = DEL_LDELIM_RE.exec(s);
+  if (!ldm) return null;
+  const n = prevChar;
+  if (!(ldm[1] || '') || !n || NT_PUNCT_RE.test(n)) {
+    const o = [...ldm[0]].length - 1;
+    let p = o;
+    const scan = masked.slice(i + o);
+    DEL_RDELIM_RE.lastIndex = 0;
+    let sm;
+    while ((sm = DEL_RDELIM_RE.exec(scan)) !== null) {
+      const g = sm[1] || sm[2] || sm[3] || sm[4] || sm[5] || sm[6];
+      if (!g) continue;
+      const l = [...g].length;
+      if (l !== o) continue;
+      if (sm[3] || sm[4]) { p += l; continue; }
+      p -= l;
+      if (p > 0) continue;
+      const use = Math.min(l, l + p);
+      const te = sm[0].codePointAt(0) > 0xFFFF ? 2 : 1;
+      const rawEnd = i + o + sm.index + te + use;
+      const M = s.slice(i, rawEnd);
+      return { html: '<del>' + parseInline(M.slice(o, -o), refs, inLink) + '</del>', end: rawEnd };
+    }
+  }
+  return null;
+}
+
+// The emphasis mask (marked's #n): link spans, code spans and HTML
+// tags become [aaa...] so the emphasis scan cannot see delimiters
+// inside them; escaped punctuation becomes + and backticks inside
+// code spans become +, so the later masks match cleanly. Every
+// replacement preserves length, so scan indices transfer to the
+// original text. Reference links whose label is defined are masked
+// too (a label containing a link is masked recursively instead).
+const BLOCK_SKIP_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+const ANY_PUNCT_OUTSIDE_CODE_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const REFLINK_LABEL_RE = /(?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?/;
+const REFLINK_REF_RE = /(?:(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})/;
+const REFLINK_SEARCH_RE = new RegExp('!?\\[' + REFLINK_LABEL_RE.source + '\\]\\[' + REFLINK_REF_RE.source + '\\]|!?\\[' + REFLINK_REF_RE.source + '\\](?:\\[\\])?(?!\\()', 'g');
+const LINK_TEST_RE = new RegExp('^!?\\[(?:\\[(?:\\[(?:\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]|\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]|\\\\[\\s\\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\\])|[^\\[\\]\\\\`])*?\\]\\([ \\t\\n]*(?:<(?:\\\\.|[^\\n<>\\\\])+>|[^ \\t\\n\\x00-\\x1f]+|(?=\\)))(?:(?:[ \\t]+(?:\\n[ \\t]*)?|\\n[ \\t]*)(?:"(?:\\\\[\\s\\S]|[^"\\\\])*"|\'(?:\\\\[\\s\\S]|[^\'\\\\])*\'|\\((?:\\\\[\\s\\S]|[^\\)\\\\])*\\)))?[ \\t\\n]*\\)');
+
+function linkInText(e, refs) {
+  if (!e.includes('[')) return false;
+  for (const m of e.matchAll(BLOCK_SKIP_RE)) {
+    if (LINK_TEST_RE.test(m[0]) && e.charAt(m.index - 1) !== '!') return true;
+  }
+  for (const m of e.matchAll(REFLINK_SEARCH_RE)) {
+    const s = m[0];
+    const r = s.lastIndexOf('[');
+    if (!(s.charAt(0) === '!' || !Object.hasOwn(refs, normLabel(s.slice(r + 1, -1)))) && !(r > 1 && linkInText(s.slice(1, r - 1), refs))) return true;
+  }
+  return false;
+}
+
+function maskEmStrong(s, refs) {
+  let t = s;
+  if (refs && s.includes('[')) {
+    const maskReflink = (r) => {
+      const o = r.lastIndexOf('[');
+      if (!Object.hasOwn(refs, normLabel(r.slice(o + 1, -1)))) return r;
+      if (o > 1 && r.charAt(0) !== '!') {
+        const label = r.slice(1, o - 1);
+        if (linkInText(label, refs)) return '[' + label.replace(REFLINK_SEARCH_RE, maskReflink) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+      }
+      return '[' + 'a'.repeat(r.length - 2) + ']';
+    };
+    t = t.replace(REFLINK_SEARCH_RE, maskReflink);
+  }
+  t = t.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (n, s1, r1) => r1 ? '+'.repeat(n.length) : s1 ? s1 + n.slice(s1.length, -s1.length).replace(/`/g, '+') + s1 : n);
+  t = t.replace(BLOCK_SKIP_RE, (n, s1, r1) => { const o = r1 ? r1.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
+  return t;
 }
 
 // Is s[from..] only whitespace (spaces, tabs, newlines and the other
@@ -639,15 +783,19 @@ function tryLink(s, open, refs, isImg) {
     // — an inner image contributes its own alt text. A tag inside the
     // alt text must not leak docInLink out (marked's De restores it).
     const savedDocInLink = docInLink;
-    const altKids = parseInline(rawText, refs, false);
+    const altHtml = parseInline(rawText, refs, false);
     docInLink = savedDocInLink;
-    const alt = stripTags(renderItems(altKids));
-    return { item: { k: 'img', src: encodeHref(dest), title: title === null ? null : escAttr(title), alt: escAttr(alt) }, end };
+    const alt = stripTags(altHtml);
+    let html = '<img src="' + escAttr(encodeHref(dest)) + '" alt="' + escAttr(alt) + '"';
+    if (title !== null) html += ' title="' + escAttr(title) + '"';
+    return { html: html + '>', end };
   }
   const savedDocInLink = docInLink;
   const kids = parseInline(rawText, refs, true);
   docInLink = savedDocInLink;
-  return { item: { k: 'link', href: encodeHref(dest), title: title === null ? null : escAttr(title), kids }, end };
+  let html = '<a href="' + escAttr(encodeHref(dest)) + '"';
+  if (title !== null) html += ' title="' + escAttr(title) + '"';
+  return { html: html + '>' + kids + '</a>', end };
 }
 
 function stripTags(html) {
@@ -655,41 +803,41 @@ function stripTags(html) {
 }
 
 // Try <...> at position i: autolink, e-mail autolink, or raw HTML.
-// Returns {item, end} or null.
+// Returns {html, end, isHtmlTag} or null.
 function tryAngle(s, i) {
   const n = s.length;
   // Comment, processing instruction, declaration, CDATA. <!--> and
   // <!---> are complete comments (abrupt closing) in marked.
   if (s.startsWith('<!--', i)) {
-    if (s.startsWith('<!-->', i)) return { item: { k: 'html', s: '<!-->' }, end: i + 5 };
-    if (s.startsWith('<!--->', i)) return { item: { k: 'html', s: '<!--->' }, end: i + 6 };
+    if (s.startsWith('<!-->', i)) return { html: '<!-->', end: i + 5, isHtmlTag: true };
+    if (s.startsWith('<!--->', i)) return { html: '<!--->', end: i + 6, isHtmlTag: true };
     const end = s.indexOf('-->', i + 4);
-    if (end >= 0) return { item: { k: 'html', s: s.slice(i, end + 3) }, end: end + 3 };
+    if (end >= 0) return { html: s.slice(i, end + 3), end: end + 3, isHtmlTag: true };
     return null;
   }
   if (s.startsWith('<?', i)) {
     const end = s.indexOf('?>', i + 2);
-    if (end >= 0) return { item: { k: 'html', s: s.slice(i, end + 2) }, end: end + 2 };
+    if (end >= 0) return { html: s.slice(i, end + 2), end: end + 2, isHtmlTag: true };
     return null;
   }
   if (s.startsWith('<!', i)) {
     if (s.startsWith('<![CDATA[', i)) {
       const end = s.indexOf(']]>', i + 9);
-      if (end >= 0) return { item: { k: 'html', s: s.slice(i, end + 3) }, end: end + 3 };
+      if (end >= 0) return { html: s.slice(i, end + 3), end: end + 3, isHtmlTag: true };
       return null;
     }
     const m = /^<![A-Za-z][^>]*>/.exec(s.slice(i));
-    if (m) return { item: { k: 'html', s: m[0] }, end: i + m[0].length };
+    if (m) return { html: m[0], end: i + m[0].length, isHtmlTag: true };
     return null;
   }
   // Closing tags take no attributes (</a href="foo"> is literal text);
   // opening tags do.
   if (s.startsWith('</', i)) {
     const m = /^<\/[A-Za-z][A-Za-z0-9-]*\s*>/.exec(s.slice(i));
-    if (m) return { item: { k: 'html', s: m[0] }, end: i + m[0].length };
+    if (m) return { html: m[0], end: i + m[0].length, isHtmlTag: true };
   } else if (/[A-Za-z]/.test(s[i + 1] || '')) {
     const m = /^<[A-Za-z][A-Za-z0-9-]*(\s+[A-Za-z_:][A-Za-z0-9_.:-]*(\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*\s*\/?>/.exec(s.slice(i));
-    if (m) return { item: { k: 'html', s: m[0] }, end: i + m[0].length };
+    if (m) return { html: m[0], end: i + m[0].length, isHtmlTag: true };
   }
   // Autolink <scheme:...> or <email>.
   const gt = s.indexOf('>', i + 1);
@@ -698,11 +846,11 @@ function tryAngle(s, i) {
     if (inner.indexOf(' ') < 0 && inner.indexOf('<') < 0 && inner.indexOf('\n') < 0) {
       if (SCHEME_RE.test(inner)) {
         const href = encodeHref(inner);
-        return { item: { k: 'link', href, title: null, kids: [{ k: 't', s: escText(inner) }] }, end: gt + 1 };
+        return { html: '<a href="' + escAttr(href) + '">' + escText(inner) + '</a>', end: gt + 1, isHtmlTag: false };
       }
       if (EMAIL_RE.test(inner)) {
         const href = 'mailto:' + inner;
-        return { item: { k: 'link', href, title: null, kids: [{ k: 't', s: escText(inner) }] }, end: gt + 1 };
+        return { html: '<a href="' + escAttr(href) + '">' + escText(inner) + '</a>', end: gt + 1, isHtmlTag: false };
       }
     }
   }
@@ -740,7 +888,7 @@ function trimAutolinkEnd(url) {
 
 // GFM extended autolink at position i. `fresh` says the position
 // follows a non-text token (a code span, link, tag, break or delimiter
-// run), which counts as a word boundary for www. Returns {item, end}
+// run), which counts as a word boundary for www. Returns {html, end}
 // or null.
 function tryGfmAutolink(s, i, fresh) {
   const rest = s.slice(i);
@@ -751,14 +899,14 @@ function tryGfmAutolink(s, i, fresh) {
     const m = GFM_MAILTO_RE.exec(rest);
     if (m) {
       const url = trimAutolinkEnd(m[0]);
-      if (url) return { item: { k: 'link', href: encodeHref(url), title: null, kids: [{ k: 't', s: escText(url) }] }, end: i + url.length };
+      if (url) return { html: '<a href="' + escAttr(encodeHref(url)) + '">' + escText(url) + '</a>', end: i + url.length };
     }
   }
   // http(s):// and ftp:// link anywhere, even mid-word (xhttp://...).
   let m = GFM_SCHEME_RE.exec(rest);
   if (m) {
     const url = trimAutolinkEnd(m[0]);
-    if (url) return { item: { k: 'link', href: encodeHref(url), title: null, kids: [{ k: 't', s: escText(url) }] }, end: i + url.length };
+    if (url) return { html: '<a href="' + escAttr(encodeHref(url)) + '">' + escText(url) + '</a>', end: i + url.length };
   }
   // www. needs a boundary: start, whitespace, ( * _ ~ [, or a fresh
   // token position. After " ! . : / { } ; and the like it stays text.
@@ -766,7 +914,7 @@ function tryGfmAutolink(s, i, fresh) {
     m = GFM_WWW_RE.exec(rest);
     if (m) {
       const url = trimAutolinkEnd(m[0]);
-      if (url) return { item: { k: 'link', href: encodeHref('http://' + url), title: null, kids: [{ k: 't', s: escText(url) }] }, end: i + url.length };
+      if (url) return { html: '<a href="' + escAttr(encodeHref('http://' + url)) + '">' + escText(url) + '</a>', end: i + url.length };
     }
   }
   return tryGfmEmail(s, i);
@@ -778,114 +926,9 @@ function tryGfmEmail(s, i) {
   const m = GFM_EMAIL_RE.exec(s.slice(i));
   if (m) {
     const email = m[0];
-    return { item: { k: 'link', href: 'mailto:' + email, title: null, kids: [{ k: 't', s: escText(email) }] }, end: i + email.length };
+    return { html: '<a href="mailto:' + email + '">' + escText(email) + '</a>', end: i + email.length };
   }
   return null;
-}
-
-// The CommonMark delimiter algorithm over the scanned items.
-function processEmphasis(items, delims) {
-  const bottom = Object.create(null);
-  for (let ci = 0; ci < delims.length; ci++) {
-    const closer = delims[ci];
-    if (!closer.close || closer.n === 0) continue;
-    const ch = closer.ch;
-    const bot = bottom[ch] === undefined ? -1 : bottom[ch];
-    let oi = ci - 1;
-    let opener = null;
-    while (oi > bot) {
-      const cand = delims[oi];
-      if (cand.ch === ch && cand.open && cand.n > 0) {
-        if (ch === '~') {
-          // Strikethrough only pairs runs of the SAME length, 1 or 2:
-          // ~~a~ and ~~~a~~~ stay literal in marked.
-          if (cand.n !== closer.n || cand.n > 2) { oi--; continue; }
-        } else if ((cand.open && cand.close) || (closer.open && closer.close)) {
-          // Odd-match rule: if EITHER delimiter can both open and close,
-          // the sum of the two runs must not be a multiple of 3 unless
-          // both are multiples of 3 (spec rule 10).
-          const sum = cand.n + closer.n;
-          if (sum % 3 === 0 && !(cand.n % 3 === 0 && closer.n % 3 === 0)) { oi--; continue; }
-        }
-        opener = cand;
-        break;
-      }
-      oi--;
-    }
-    if (!opener) {
-      // Only a closer that cannot itself open can be the lower bound:
-      // a closer that can open is still a potential opener for a later
-      // closer (foo*bar* — the first * must stay searchable).
-      if (!closer.open) bottom[ch] = ci;
-      continue;
-    }
-    let use;
-    if (ch === '~') use = opener.n;
-    else use = (opener.n >= 2 && closer.n >= 2) ? 2 : 1;
-    const tag = ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
-    wrapDelimiters(items, opener, closer, tag, use);
-    // Delimiter runs strictly between the opener and closer lose their
-    // ability to open (they can still close): *foo _bar* baz_ leaves
-    // the _ pair literal because the _bar opener was deactivated.
-    const oiPos = delims.indexOf(opener);
-    const ciPos = delims.indexOf(closer);
-    if (oiPos >= 0 && ciPos > oiPos) {
-      for (let k = oiPos + 1; k < ciPos; k++) delims[k].open = false;
-    }
-    opener.n -= use;
-    closer.n -= use;
-    if (opener.n === 0) {
-      const idx = delims.indexOf(opener);
-      if (idx >= 0) delims.splice(idx, 1);
-      if (idx <= ci) ci--;
-      if (bottom[ch] !== undefined && bottom[ch] >= idx) bottom[ch]--;
-    }
-    if (closer.n > 0) { ci--; continue; }
-  }
-}
-
-// Replace the opener/closer delimiter items with open/close markers.
-// A partially-used delimiter keeps its item (with its leftover count,
-// decremented by the caller) so it can match again — that is what makes
-// ****foo**** become <strong><strong>foo</strong></strong> instead of
-// leaving the outer pair literal. The open marker goes after the
-// opener's leftover characters; the close marker goes before the
-// closer's leftover characters.
-function wrapDelimiters(items, opener, closer, tag, use) {
-  const oi = items.indexOf(opener);
-  const ci = items.indexOf(closer);
-  if (oi < 0 || ci < 0 || ci <= oi) return;
-  const leftOver = opener.n - use;
-  const rightOver = closer.n - use;
-  if (leftOver > 0) items.splice(oi + 1, 0, { k: 'open', tag });
-  else items.splice(oi, 1, { k: 'open', tag });
-  const ci2 = items.indexOf(closer);
-  if (rightOver > 0) items.splice(ci2, 0, { k: 'close', tag });
-  else items.splice(ci2, 1, { k: 'close', tag });
-}
-
-function renderItems(items) {
-  let out = '';
-  for (const it of items) {
-    if (it.k === 't' || it.k === 'code') {
-      out += it.k === 'code' ? '<code>' + it.s + '</code>' : it.s;
-    } else if (it.k === 'br') out += '<br>';
-    else if (it.k === 'html') out += it.s;
-    else if (it.k === 'open') out += '<' + it.tag + '>';
-    else if (it.k === 'close') out += '</' + it.tag + '>';
-    else if (it.k === 'link') {
-      out += '<a href="' + escAttr(it.href) + '"';
-      if (it.title !== null) out += ' title="' + it.title + '"';
-      out += '>' + renderItems(it.kids) + '</a>';
-    } else if (it.k === 'img') {
-      out += '<img src="' + escAttr(it.src) + '" alt="' + it.alt + '"';
-      if (it.title !== null) out += ' title="' + it.title + '"';
-      out += '>';
-    } else if (it.k === 'd') {
-      if (it.n > 0) out += escText(it.ch.repeat(it.n));
-    }
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------- blocks
@@ -2162,7 +2205,7 @@ function openItem(stack, ordered, startNum, wantDelim, indent, remainder, absMar
 // ---------------------------------------------------------------- rendering
 
 function renderInline(text, refs) {
-  return renderItems(parseInline(text, refs));
+  return parseInline(text, refs);
 }
 
 function renderBlocks(nodes, refs) {
