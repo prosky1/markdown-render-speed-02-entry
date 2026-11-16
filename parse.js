@@ -1935,12 +1935,12 @@ function parseBlocks(src, refs) {
     // Fenced code.
     const fence = FENCE_RE.exec(content);
     if (fence) {
-      closeLeaf();
       const info = content.slice(fence[0].length).trim();
       if (fence[1][0] === '`' && info.indexOf('`') >= 0) {
         // A backtick fence cannot carry backticks in its info string:
-        // treat the line as paragraph text.
+        // treat the line as paragraph text (do not close the leaf).
       } else {
+        closeLeaf();
         tip = addChild(top(), { type: 'code', fenced: true, fenceChar: fence[1][0], fenceLen: fence[1].length, info, fenceIndent: indentOf(content, base).col, lines: [] });
         return;
       }
@@ -2076,7 +2076,8 @@ function parseBlocks(src, refs) {
 // decide lazy continuation).
 function startsInterrupt(content, para) {
   if (ATX_RE.test(content)) return true;
-  if (FENCE_RE.test(content)) return true;
+  const fence = FENCE_RE.exec(content);
+  if (fence && !(fence[1][0] === '`' && content.slice(fence[0].length).indexOf('`') >= 0)) return true;
   if (htmlBlockType(content, true) > 0) return true;
   if (HR_RE.test(content)) return true;
   const bm = BULLET_RE.exec(content) || ORDERED_RE.exec(content);
