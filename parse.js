@@ -386,11 +386,10 @@ function findCodeClose(s, from, len) {
 
 // Find the index of the `]` matching the `[` at `open` (depth-aware,
 // skipping backslash escapes). Backticks follow marked's label
-// pattern: a backtick run must form a complete code span (the closing
-// run need not match the opening run's length) or sit immediately
-// before the closing `]` — an unclosed backtick anywhere else makes
-// the whole label fail. The span closer is backtracked: the first
-// (shortest-content) closer is tried first, then later ones.
+// pattern: a backtick run must form a complete code span with the next
+// backtick run as its closer (the runs need not match in length) or
+// sit immediately before the closing `]` as a run of two or more —
+// an unclosed backtick anywhere else makes the whole label fail.
 function findLinkEnd(s, open) {
   return scanLabel(s, open + 1, 1);
 }
@@ -410,22 +409,19 @@ function scanLabel(s, i, depth) {
     if (c === '`') {
       let j = i;
       while (j < n && s[j] === '`') j++;
-      // Try each later backtick run as the span closer, shortest
-      // content first.
-      let k = j;
-      while (k < n) {
-        const nb = s.indexOf('`', k);
-        if (nb < 0) break;
+      // The span closer is the NEXT backtick run: the pattern's
+      // content [^`]*? cannot hold a backtick, so there is no choice
+      // to backtrack over.
+      const nb = s.indexOf('`', j);
+      if (nb >= 0) {
         let m = nb;
         while (m < n && s[m] === '`') m++;
-        const r = scanLabel(s, m, depth);
-        if (r >= 0) return r;
-        k = m;
+        i = m;
+        continue;
       }
-      // No span closer worked: the run is only valid immediately
-      // before a ] when it is TWO or more backticks (marked's
-      // alternative is `` ``+(?=\]) `` — a single backtick there
-      // fails the whole label).
+      // No closer: the run is only valid immediately before a ] when
+      // it is TWO or more backticks (marked's alternative is
+      // `` ``+(?=\]) `` — a single backtick there fails the label).
       if (j - i >= 2 && j < n && s[j] === ']') {
         depth--;
         if (depth === 0) return j;
